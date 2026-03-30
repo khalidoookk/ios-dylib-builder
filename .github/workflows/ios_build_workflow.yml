@@ -165,6 +165,24 @@ jobs:
             compile_file "$src" "$obj" "clang++" "-x" "objective-c++" "-fobjc-arc" "-std=c++17"
           done < "${SRC_LIST}.mm"
 
+          if [ "$SWIFT_COUNT" -gt 0 ]; then
+            echo "=== Compiling Swift sources ==="
+            SWIFT_ARGS=($ARCH -sdk "$SDK_PATH" -target arm64-apple-ios12.0)
+            while IFS= read -r src; do
+              [ -z "$src" ] && continue
+              obj="${src%.swift}.o"
+              COMPILED=$((COMPILED + 1))
+              echo "[$COMPILED/$TOTAL] Compiling: $src"
+              swiftc -c -o "$obj" "${SWIFT_ARGS[@]}" "${FW_SEARCH_ARGS[@]}" "$src" 2>&1 | tee -a "$BUILD_LOG"
+              if [ ${PIPESTATUS[0]} -ne 0 ]; then
+                COMPILE_OK=false
+                echo "FAILED: $src"
+              else
+                echo "$obj" >> "$OBJ_LIST_FILE"
+              fi
+            done < "${SRC_LIST}.swift"
+          fi
+
           if [ "$COMPILE_OK" = false ]; then
             ERROR_MSG=$(grep -i "error:" "$BUILD_LOG" | head -40)
             if [ -z "$ERROR_MSG" ]; then
