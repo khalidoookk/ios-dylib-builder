@@ -36,7 +36,7 @@ jobs:
           find source_code -name ".DS_Store" -delete 2>/dev/null || true
 
           echo "=== Extracted files ==="
-          find source_code -type f
+          find source_code -type f | head -200
 
       - name: Compile dylib
         run: |
@@ -57,152 +57,118 @@ jobs:
               --data-urlencode "text=${MSG}"
           }
 
-          SWIFT_SOURCES=$(find . -type f -name "*.swift" | tr '\n' ' ')
-          C_SOURCES=$(find . -type f -name "*.c" | tr '\n' ' ')
-          CPP_SOURCES=$(find . -type f \( -name "*.cpp" -o -name "*.cxx" -o -name "*.cc" \) | tr '\n' ' ')
-          OBJC_SOURCES=$(find . -type f -name "*.m" | tr '\n' ' ')
-          OBJCPP_SOURCES=$(find . -type f -name "*.mm" | tr '\n' ' ')
+          FRAMEWORK_FLAGS=""
+          FRAMEWORK_SEARCH=""
+          while IFS= read -r -d '' fw_dir; do
+            fw_name=$(basename "$fw_dir" .framework)
+            FRAMEWORK_FLAGS="$FRAMEWORK_FLAGS -framework $fw_name"
+            fw_parent=$(dirname "$fw_dir")
+            FRAMEWORK_SEARCH="$FRAMEWORK_SEARCH -F\"$fw_parent\""
+            echo "Found framework: $fw_name at $fw_dir"
+          done < <(find . -name "*.framework" -type d -print0)
 
-          ALL_C="$C_SOURCES $CPP_SOURCES $OBJC_SOURCES $OBJCPP_SOURCES"
-          ALL_SOURCES="$SWIFT_SOURCES $ALL_C"
+          mapfile -t C_SOURCES < <(find . -name "*.c" -not -path "*/.vscode/*" -not -path "*/xcuserdata/*" -type f)
+          mapfile -t CPP_SOURCES < <(find . \( -name "*.cpp" -o -name "*.cxx" -o -name "*.cc" \) -not -path "*/.vscode/*" -not -path "*/xcuserdata/*" -type f)
+          mapfile -t OBJC_SOURCES < <(find . -name "*.m" -not -path "*/.vscode/*" -not -path "*/xcuserdata/*" -type f)
+          mapfile -t OBJCPP_SOURCES < <(find . -name "*.mm" -not -path "*/.vscode/*" -not -path "*/xcuserdata/*" -type f)
+          mapfile -t SWIFT_SOURCES < <(find . -name "*.swift" -not -path "*/.vscode/*" -not -path "*/xcuserdata/*" -type f)
 
-          echo "Swift:   $SWIFT_SOURCES"
-          echo "C:       $C_SOURCES"
-          echo "C++:     $CPP_SOURCES"
-          echo "ObjC:    $OBJC_SOURCES"
-          echo "ObjC++:  $OBJCPP_SOURCES"
+          TOTAL=$(( ${#C_SOURCES[@]} + ${#CPP_SOURCES[@]} + ${#OBJC_SOURCES[@]} + ${#OBJCPP_SOURCES[@]} + ${#SWIFT_SOURCES[@]} ))
+          echo "Found $TOTAL source files: ${#C_SOURCES[@]} C, ${#CPP_SOURCES[@]} C++, ${#OBJC_SOURCES[@]} ObjC, ${#OBJCPP_SOURCES[@]} ObjC++, ${#SWIFT_SOURCES[@]} Swift"
 
-          if [ -z "$(echo $ALL_SOURCES | tr -d ' ')" ]; then
+          if [ "$TOTAL" -eq 0 ]; then
             send_telegram "❌ فشل البناء: لم يتم العثور على ملفات مصدر داخل الملف المرسل.
 
           الملفات المدعومة: .swift .m .mm .c .cpp .cxx .cc"
             exit 1
           fi
 
-          HEADER_DIRS=$(find . -type d | sort -u)
           INCLUDE_FLAGS=""
-          for dir in $HEADER_DIRS; do
-            INCLUDE_FLAGS="$INCLUDE_FLAGS -I$dir"
-          done
+          while IFS= read -r -d '' dir; do
+            INCLUDE_FLAGS="$INCLUDE_FLAGS -I\"$dir\""
+          done < <(find . -type d -print0)
+
+          COMMON_FLAGS="$ARCH -isysroot \"$SDK_PATH\" -target arm64-apple-ios12.0 -DTARGET_OS_IPHONE=1"
+          COMMON_FLAGS="$COMMON_FLAGS -Wno-unused-variable -Wno-unused-function -Wno-deprecated-declarations"
+          COMMON_FLAGS="$COMMON_FLAGS -Wno-unused-but-set-variable -Wno-unused-value -Wno-nullability-completeness"
+          COMMON_FLAGS="$COMMON_FLAGS -Wno-expansion-to-defined -Wno-nullable-to-nonnull-conversion"
+          COMMON_FLAGS="$COMMON_FLAGS -Wno-incompatible-pointer-types -Wno-format -Wno-objc-method-access"
+          COMMON_FLAGS="$COMMON_FLAGS -fvisibility=hidden -fvisibility-inlines-hidden"
 
           COMPILE_OK=true
+          OBJ_FILES=()
+          COMPILED=0
 
-          if [ ! -z "$(echo $SWIFT_SOURCES | tr -d ' ')" ]; then
-            echo "=== Compiling C/C++/ObjC objects for Swift linking ==="
-            OBJ_FILES=""
+          compile_file() {
+            local src="$1"
+            local obj="$2"
+            local compiler="$3"
+            local extra_flags="$4"
 
-            for src in $C_SOURCES; do
-              obj="${src%.c}.o"
-              clang -c -o "$obj" $ARCH -isysroot "$SDK_PATH" -target arm64-apple-ios15.0 \
-                $INCLUDE_FLAGS -Wno-unused-variable -Wno-unused-function \
-                "$src" 2>&1 | tee -a "$BUILD_LOG" || COMPILE_OK=false
-              OBJ_FILES="$OBJ_FILES $obj"
-            done
-            for src in $CPP_SOURCES; do
-              obj="${src%.*}.o"
-              clang++ -c -o "$obj" $ARCH -isysroot "$SDK_PATH" -target arm64-apple-ios15.0 \
-                $INCLUDE_FLAGS -std=c++17 -Wno-unused-variable -Wno-unused-function \
-                "$src" 2>&1 | tee -a "$BUILD_LOG" || COMPILE_OK=false
-              OBJ_FILES="$OBJ_FILES $obj"
-            done
-            for src in $OBJC_SOURCES; do
-              obj="${src%.m}.o"
-              clang -c -o "$obj" $ARCH -isysroot "$SDK_PATH" -target arm64-apple-ios15.0 \
-                $INCLUDE_FLAGS -x objective-c -fobjc-arc -Wno-unused-variable -Wno-unused-function \
-                "$src" 2>&1 | tee -a "$BUILD_LOG" || COMPILE_OK=false
-              OBJ_FILES="$OBJ_FILES $obj"
-            done
-            for src in $OBJCPP_SOURCES; do
-              obj="${src%.mm}.o"
-              clang++ -c -o "$obj" $ARCH -isysroot "$SDK_PATH" -target arm64-apple-ios15.0 \
-                $INCLUDE_FLAGS -x objective-c++ -fobjc-arc -std=c++17 -Wno-unused-variable -Wno-unused-function \
-                "$src" 2>&1 | tee -a "$BUILD_LOG" || COMPILE_OK=false
-              OBJ_FILES="$OBJ_FILES $obj"
-            done
+            COMPILED=$((COMPILED + 1))
+            echo "[$COMPILED/$TOTAL] Compiling: $src"
+            eval "$compiler" -c -o "\"$obj\"" $COMMON_FLAGS $INCLUDE_FLAGS $FRAMEWORK_SEARCH $extra_flags "\"$src\"" 2>&1 | tee -a "$BUILD_LOG"
+            if [ ${PIPESTATUS[0]} -ne 0 ]; then
+              COMPILE_OK=false
+              echo "FAILED: $src"
+            fi
+            OBJ_FILES+=("$obj")
+          }
 
-            if [ "$COMPILE_OK" = false ]; then
-              ERROR_MSG=$(sed -n '1,50p' "$BUILD_LOG")
-              send_telegram "❌ فشل البناء أثناء ترجمة ملفات C/ObjC.
+          for src in "${C_SOURCES[@]}"; do
+            obj="${src%.c}.o"
+            compile_file "$src" "$obj" "clang" ""
+          done
+
+          for src in "${CPP_SOURCES[@]}"; do
+            obj="${src%.*}.o"
+            compile_file "$src" "$obj" "clang++" "-std=c++17"
+          done
+
+          for src in "${OBJC_SOURCES[@]}"; do
+            obj="${src%.m}.o"
+            compile_file "$src" "$obj" "clang" "-x objective-c -fobjc-arc"
+          done
+
+          for src in "${OBJCPP_SOURCES[@]}"; do
+            obj="${src%.mm}.o"
+            compile_file "$src" "$obj" "clang++" "-x objective-c++ -fobjc-arc -std=c++17"
+          done
+
+          if [ "$COMPILE_OK" = false ]; then
+            ERROR_MSG=$(tail -80 "$BUILD_LOG" | grep -i "error" | head -40)
+            if [ -z "$ERROR_MSG" ]; then
+              ERROR_MSG=$(tail -50 "$BUILD_LOG")
+            fi
+            send_telegram "❌ فشل البناء أثناء الترجمة.
 
           ${ERROR_MSG}"
-              exit 1
-            fi
-
-            echo "=== Compiling Swift and linking ==="
-            swiftc -emit-library -o "$OUTPUT" $ARCH -sdk "$SDK_PATH" \
-              -target arm64-apple-ios15.0 \
-              $INCLUDE_FLAGS \
-              $SWIFT_SOURCES $OBJ_FILES 2>&1 | tee "$BUILD_LOG" || COMPILE_OK=false
-          else
-            echo "=== Compiling object files ==="
-            OBJ_FILES=""
-
-            for src in $C_SOURCES; do
-              obj="${src%.c}.o"
-              echo "Compiling $src..."
-              clang -c -o "$obj" $ARCH -isysroot "$SDK_PATH" \
-                -target arm64-apple-ios15.0 \
-                $INCLUDE_FLAGS \
-                -Wno-unused-variable -Wno-unused-function \
-                "$src" 2>&1 | tee -a "$BUILD_LOG" || COMPILE_OK=false
-              OBJ_FILES="$OBJ_FILES $obj"
-            done
-
-            for src in $CPP_SOURCES; do
-              obj="${src%.*}.o"
-              echo "Compiling $src..."
-              clang++ -c -o "$obj" $ARCH -isysroot "$SDK_PATH" \
-                -target arm64-apple-ios15.0 \
-                $INCLUDE_FLAGS \
-                -std=c++17 -Wno-unused-variable -Wno-unused-function \
-                "$src" 2>&1 | tee -a "$BUILD_LOG" || COMPILE_OK=false
-              OBJ_FILES="$OBJ_FILES $obj"
-            done
-
-            for src in $OBJC_SOURCES; do
-              obj="${src%.m}.o"
-              echo "Compiling $src..."
-              clang -c -o "$obj" $ARCH -isysroot "$SDK_PATH" \
-                -target arm64-apple-ios15.0 \
-                $INCLUDE_FLAGS \
-                -x objective-c -fobjc-arc \
-                -Wno-unused-variable -Wno-unused-function \
-                "$src" 2>&1 | tee -a "$BUILD_LOG" || COMPILE_OK=false
-              OBJ_FILES="$OBJ_FILES $obj"
-            done
-
-            for src in $OBJCPP_SOURCES; do
-              obj="${src%.mm}.o"
-              echo "Compiling $src..."
-              clang++ -c -o "$obj" $ARCH -isysroot "$SDK_PATH" \
-                -target arm64-apple-ios15.0 \
-                $INCLUDE_FLAGS \
-                -x objective-c++ -fobjc-arc -std=c++17 \
-                -Wno-unused-variable -Wno-unused-function \
-                "$src" 2>&1 | tee -a "$BUILD_LOG" || COMPILE_OK=false
-              OBJ_FILES="$OBJ_FILES $obj"
-            done
-
-            if [ "$COMPILE_OK" = false ]; then
-              ERROR_MSG=$(sed -n '1,50p' "$BUILD_LOG")
-              send_telegram "❌ فشل البناء أثناء الترجمة.
-
-          ${ERROR_MSG}"
-              exit 1
-            fi
-
-            echo "=== Linking ==="
-            clang -dynamiclib -o "$OUTPUT" $ARCH -isysroot "$SDK_PATH" \
-              -target arm64-apple-ios15.0 \
-              $OBJ_FILES \
-              -framework Foundation -framework UIKit \
-              -fobjc-arc \
-              2>&1 | tee -a "$BUILD_LOG" || COMPILE_OK=false
+            exit 1
           fi
 
-          if [ ! -f "$OUTPUT" ] || [ "$COMPILE_OK" = false ]; then
-            ERROR_MSG=$(sed -n '1,50p' "$BUILD_LOG")
-            send_telegram "❌ فشل البناء. سبب الخطأ:
+          echo "=== Linking ${#OBJ_FILES[@]} object files ==="
+
+          LINK_FRAMEWORKS="-framework Foundation -framework UIKit -framework Metal -framework MetalKit -framework AVFoundation -framework CoreGraphics -framework QuartzCore -framework Security"
+
+          OBJ_LIST=$(mktemp)
+          for obj in "${OBJ_FILES[@]}"; do
+            echo "$obj" >> "$OBJ_LIST"
+          done
+
+          eval clang++ -dynamiclib -o "\"$OUTPUT\"" $ARCH -isysroot "\"$SDK_PATH\"" \
+            -target arm64-apple-ios12.0 \
+            -filelist "\"$OBJ_LIST\"" \
+            $FRAMEWORK_SEARCH \
+            $LINK_FRAMEWORKS $FRAMEWORK_FLAGS \
+            -fobjc-arc \
+            -dead_strip \
+            -Wl,-undefined,dynamic_lookup \
+            -install_name @rpath/"$OUTPUT" \
+            2>&1 | tee -a "$BUILD_LOG"
+
+          if [ ! -f "$OUTPUT" ] || [ ${PIPESTATUS[0]} -ne 0 ]; then
+            ERROR_MSG=$(tail -50 "$BUILD_LOG")
+            send_telegram "❌ فشل الربط. سبب الخطأ:
 
           ${ERROR_MSG}"
             exit 1
@@ -210,6 +176,7 @@ jobs:
 
           echo "Build successful: $OUTPUT"
           ls -lh "$OUTPUT"
+          file "$OUTPUT"
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
