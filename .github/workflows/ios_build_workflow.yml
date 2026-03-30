@@ -1,82 +1,201 @@
-name: Build iOS dylib (v4.3.0 Support)
+name: Build iOS dylib
 
 on:
   workflow_dispatch:
     inputs:
       file_url:
-        description: 'URL of the zip file to build'
+        description: 'URL of the zip/tar.gz file to build'
         required: true
       chat_id:
         description: 'Telegram Chat ID to send the result back'
         required: true
+      dylib_name:
+        description: 'Name for the output dylib file (without extension)'
+        required: false
+        default: 'output'
 
 jobs:
   build:
     runs-on: macos-latest
     steps:
-      - name: Download source
+      - name: Download and extract source
         run: |
-          curl -L "${{ github.event.inputs.file_url }}" -o project.zip
-          mkdir source_code
-          unzip project.zip -d source_code
+          FILE_URL="${{ github.event.inputs.file_url }}"
+
+          if [[ "$FILE_URL" == *.tar.gz ]]; then
+            curl -L "$FILE_URL" -o project.tar.gz
+            mkdir -p source_code
+            tar -xzf project.tar.gz -C source_code
+          else
+            curl -L "$FILE_URL" -o project.zip
+            mkdir -p source_code
+            unzip -o -q project.zip -d source_code
+          fi
+
+          find source_code -name "__MACOSX" -exec rm -rf {} + 2>/dev/null || true
+          find source_code -name ".DS_Store" -delete 2>/dev/null || true
+
+          echo "=== Extracted files ==="
+          find source_code -type f
 
       - name: Compile dylib
-        id: compile
         run: |
           cd source_code
-          
-          # البحث عن كافة ملفات المصدر في جميع المجلدات الفرعية
-          SOURCES=$(find . -name "*.c" -o -name "*.cpp" -o -name "*.m" -o -name "*.mm" -o -name "*.swift")
-          
-          if [ -z "$SOURCES" ]; then
-            echo "ERROR_MSG=❌ فشل البناء. لم يتم العثور على أي ملفات مصدر (.c, .cpp, .swift, .m, .mm) داخل الملف المضغوط. يرجى التأكد من محتوى الملف." >> $GITHUB_ENV
+
+          DYLIB_NAME="${{ github.event.inputs.dylib_name }}"
+          OUTPUT="${DYLIB_NAME}.dylib"
+          SDK_PATH=$(xcrun --sdk iphoneos --show-sdk-path)
+          ARCH="-arch arm64"
+          BUILD_LOG=$(mktemp)
+          CHAT_ID="${{ github.event.inputs.chat_id }}"
+          BOT_TOKEN="${{ secrets.TELEGRAM_TOKEN }}"
+
+          send_telegram() {
+            local MSG="$1"
+            curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+              --data-urlencode "chat_id=${CHAT_ID}" \
+              --data-urlencode "text=${MSG}" \
+              --data-urlencode "parse_mode=HTML" > /dev/null 2>&1 || true
+          }
+
+          SWIFT_SOURCES=$(find . -type f -name "*.swift" | tr '\n' ' ')
+          C_SOURCES=$(find . -type f -name "*.c" | tr '\n' ' ')
+          CPP_SOURCES=$(find . -type f \( -name "*.cpp" -o -name "*.cxx" -o -name "*.cc" \) | tr '\n' ' ')
+          OBJC_SOURCES=$(find . -type f -name "*.m" | tr '\n' ' ')
+          OBJCPP_SOURCES=$(find . -type f -name "*.mm" | tr '\n' ' ')
+
+          ALL_C="$C_SOURCES $CPP_SOURCES $OBJC_SOURCES $OBJCPP_SOURCES"
+          ALL_SOURCES="$SWIFT_SOURCES $ALL_C"
+
+          echo "Swift:   $SWIFT_SOURCES"
+          echo "C:       $C_SOURCES"
+          echo "C++:     $CPP_SOURCES"
+          echo "ObjC:    $OBJC_SOURCES"
+          echo "ObjC++:  $OBJCPP_SOURCES"
+
+          if [ -z "$(echo $ALL_SOURCES | tr -d ' ')" ]; then
+            send_telegram "❌ فشل البناء: لم يتم العثور على ملفات مصدر داخل الملف المرسل.
+
+          الملفات المدعومة: .swift .m .mm .c .cpp .cxx .cc"
             exit 1
           fi
 
-          # تحديد المعمارية والـ SDK
-          SDK_PATH=$(xcrun --sdk iphoneos --show-sdk-path)
-          ARCH="-arch arm64"
-          
-          # إعدادات إضافية للتوافق مع ببجي 4.3.0 وكافة النسخ
-          # -miphoneos-version-min=14.0 لضمان العمل على أغلب الأجهزة الحديثة
-          # -dynamiclib لإنشاء ملف dylib
-          # -undefined dynamic_lookup للسماح بالبحث عن الرموز أثناء التشغيل (مهم للحقن)
-          COMMON_FLAGS="$ARCH -isysroot $SDK_PATH -miphoneos-version-min=14.0 -dynamiclib -undefined dynamic_lookup -fembed-bitcode -O3"
-          
-          # فصل ملفات Swift عن ملفات C/C++/ObjC
-          SWIFT_SOURCES=$(find . -name "*.swift")
-          C_SOURCES=$(find . -name "*.c" -o -name "*.cpp" -o -name "*.m" -o -name "*.mm")
+          HEADER_DIRS=$(find . -type d | sort -u)
+          INCLUDE_FLAGS=""
+          for dir in $HEADER_DIRS; do
+            INCLUDE_FLAGS="$INCLUDE_FLAGS -I$dir"
+          done
 
-          if [ ! -z "$SWIFT_SOURCES" ]; then
-            echo "Compiling Swift sources for PUBG 4.3.0..."
-            swiftc -emit-library -o output.dylib $ARCH -sdk $SDK_PATH $SWIFT_SOURCES $C_SOURCES -O -whole-module-optimization || { echo "ERROR_MSG=❌ فشل البناء أثناء ترجمة ملفات Swift. يرجى التأكد من سلامة الكود." >> $GITHUB_ENV; exit 1; }
+          COMPILE_OK=true
+
+          if [ ! -z "$(echo $SWIFT_SOURCES | tr -d ' ')" ]; then
+            echo "=== Compiling with swiftc ==="
+            swiftc -emit-library -o "$OUTPUT" $ARCH -sdk "$SDK_PATH" \
+              -target arm64-apple-ios15.0 \
+              $INCLUDE_FLAGS \
+              $SWIFT_SOURCES $ALL_C 2>&1 | tee "$BUILD_LOG" || COMPILE_OK=false
           else
-            echo "Compiling C/C++/ObjC sources for PUBG 4.3.0..."
-            clang $COMMON_FLAGS -o output.dylib $C_SOURCES -framework Foundation -framework UIKit -framework QuartzCore || { echo "ERROR_MSG=❌ فشل البناء أثناء ترجمة ملفات C/ObjC. يرجى التأكد من سلامة الكود." >> $GITHUB_ENV; exit 1; }
+            echo "=== Compiling object files ==="
+            OBJ_FILES=""
+
+            for src in $C_SOURCES; do
+              obj="${src%.c}.o"
+              echo "Compiling $src..."
+              clang -c -o "$obj" $ARCH -isysroot "$SDK_PATH" \
+                -target arm64-apple-ios15.0 \
+                $INCLUDE_FLAGS \
+                -Wno-unused-variable -Wno-unused-function \
+                "$src" 2>&1 | tee -a "$BUILD_LOG" || COMPILE_OK=false
+              OBJ_FILES="$OBJ_FILES $obj"
+            done
+
+            for src in $CPP_SOURCES; do
+              obj="${src%.*}.o"
+              echo "Compiling $src..."
+              clang++ -c -o "$obj" $ARCH -isysroot "$SDK_PATH" \
+                -target arm64-apple-ios15.0 \
+                $INCLUDE_FLAGS \
+                -std=c++17 -Wno-unused-variable -Wno-unused-function \
+                "$src" 2>&1 | tee -a "$BUILD_LOG" || COMPILE_OK=false
+              OBJ_FILES="$OBJ_FILES $obj"
+            done
+
+            for src in $OBJC_SOURCES; do
+              obj="${src%.m}.o"
+              echo "Compiling $src..."
+              clang -c -o "$obj" $ARCH -isysroot "$SDK_PATH" \
+                -target arm64-apple-ios15.0 \
+                $INCLUDE_FLAGS \
+                -x objective-c -fobjc-arc \
+                -Wno-unused-variable -Wno-unused-function \
+                "$src" 2>&1 | tee -a "$BUILD_LOG" || COMPILE_OK=false
+              OBJ_FILES="$OBJ_FILES $obj"
+            done
+
+            for src in $OBJCPP_SOURCES; do
+              obj="${src%.mm}.o"
+              echo "Compiling $src..."
+              clang++ -c -o "$obj" $ARCH -isysroot "$SDK_PATH" \
+                -target arm64-apple-ios15.0 \
+                $INCLUDE_FLAGS \
+                -x objective-c++ -fobjc-arc -std=c++17 \
+                -Wno-unused-variable -Wno-unused-function \
+                "$src" 2>&1 | tee -a "$BUILD_LOG" || COMPILE_OK=false
+              OBJ_FILES="$OBJ_FILES $obj"
+            done
+
+            if [ "$COMPILE_OK" = false ]; then
+              ERROR_MSG=$(grep -E "error:" "$BUILD_LOG" | head -50)
+              if [ -z "$ERROR_MSG" ]; then
+                ERROR_MSG=$(tail -50 "$BUILD_LOG")
+              fi
+              send_telegram "❌ فشل البناء أثناء الترجمة.
+
+          ${ERROR_MSG}"
+              exit 1
+            fi
+
+            echo "=== Linking ==="
+            clang -dynamiclib -o "$OUTPUT" $ARCH -isysroot "$SDK_PATH" \
+              -target arm64-apple-ios15.0 \
+              $OBJ_FILES \
+              -framework Foundation -framework UIKit \
+              -fobjc-arc \
+              2>&1 | tee -a "$BUILD_LOG" || COMPILE_OK=false
           fi
-          echo "BUILD_SUCCESS=true" >> $GITHUB_ENV
+
+          if [ ! -f "$OUTPUT" ] || [ "$COMPILE_OK" = false ]; then
+            ERROR_MSG=$(grep -E "error:" "$BUILD_LOG" | head -50)
+            if [ -z "$ERROR_MSG" ]; then
+              ERROR_MSG=$(tail -50 "$BUILD_LOG")
+            fi
+            send_telegram "❌ فشل البناء. سبب الخطأ:
+
+          ${ERROR_MSG}"
+            exit 1
+          fi
+
+          echo "Build successful: $OUTPUT"
+          ls -lh "$OUTPUT"
 
       - name: Upload Artifact
-        if: env.BUILD_SUCCESS == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: ios-dylib
-          path: source_code/output.dylib
+          path: source_code/${{ github.event.inputs.dylib_name }}.dylib
 
-      - name: Send Success to Telegram
-        if: env.BUILD_SUCCESS == 'true'
+      - name: Send dylib to Telegram
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           CHAT_ID: ${{ github.event.inputs.chat_id }}
+          DYLIB_NAME: ${{ github.event.inputs.dylib_name }}
         run: |
-          curl -F "chat_id=$CHAT_ID" -F "document=@source_code/output.dylib" -F "caption=✅ تم بناء ملف الـ .dylib بنجاح لـ iOS ARM64! 🚀\n📦 متوافق مع ببجي 4.3.0 وكافة النسخ." "https://api.telegram.org/bot$TELEGRAM_TOKEN/sendDocument"
+          OUTPUT_FILE="source_code/${DYLIB_NAME}.dylib"
+          FILE_SIZE=$(du -sh "${OUTPUT_FILE}" | cut -f1)
 
-      - name: Send Failure to Telegram
-        if: failure()
-        env:
-          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
-          CHAT_ID: ${{ github.event.inputs.chat_id }}
-        run: |
-          MSG="${{ env.ERROR_MSG }}"
-          if [ -z "$MSG" ]; then MSG="❌ حدث خطأ غير متوقع أثناء عملية البناء على GitHub Actions."; fi
-          curl -X POST "https://api.telegram.org/bot$TELEGRAM_TOKEN/sendMessage" -d "chat_id=$CHAT_ID&text=$MSG"
+          curl -s -F "chat_id=$CHAT_ID" \
+            -F "document=@${OUTPUT_FILE};filename=${DYLIB_NAME}.dylib" \
+            -F "caption=✅ تم البناء بنجاح!
+          📦 الملف: ${DYLIB_NAME}.dylib
+          📐 الحجم: ${FILE_SIZE}" \
+            "https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendDocument"
