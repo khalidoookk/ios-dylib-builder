@@ -1,0 +1,60 @@
+name: Build iOS dylib
+
+on:
+  workflow_dispatch:
+    inputs:
+      file_url:
+        description: 'URL of the zip file to build'
+        required: true
+      chat_id:
+        description: 'Telegram Chat ID to send the result back'
+        required: true
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - name: Download source
+        run: |
+          curl -L "${{ github.event.inputs.file_url }}" -o project.zip
+          unzip project.zip -d source_code
+
+      - name: Compile dylib
+        run: |
+          cd source_code
+          # البحث عن كافة ملفات المصدر المدعومة
+          SOURCES=$(find . -name "*.c" -o -name "*.cpp" -o -name "*.m" -o -name "*.mm" -o -name "*.swift")
+          
+          if [ -z "$SOURCES" ]; then
+            echo "No source files found!"
+            exit 1
+          fi
+
+          # تحديد المعمارية والـ SDK
+          SDK_PATH=$(xcrun --sdk iphoneos --show-sdk-path)
+          ARCH="-arch arm64"
+          
+          # فصل ملفات Swift عن ملفات C/C++/ObjC
+          SWIFT_SOURCES=$(find . -name "*.swift")
+          C_SOURCES=$(find . -name "*.c" -o -name "*.cpp" -o -name "*.m" -o -name "*.mm")
+
+          if [ ! -z "$SWIFT_SOURCES" ]; then
+            echo "Compiling Swift sources..."
+            swiftc -emit-library -o output.dylib $ARCH -sdk $SDK_PATH $SWIFT_SOURCES $C_SOURCES
+          else
+            echo "Compiling C/C++/ObjC sources..."
+            clang -dynamiclib -o output.dylib $ARCH -isysroot $SDK_PATH $C_SOURCES -framework Foundation
+          fi
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-dylib
+          path: source_code/output.dylib
+
+      - name: Send to Telegram
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          CHAT_ID: ${{ github.event.inputs.chat_id }}
+        run: |
+          curl -F "chat_id=$CHAT_ID" -F "document=@source_code/output.dylib" "https://api.telegram.org/bot$TELEGRAM_TOKEN/sendDocument"
