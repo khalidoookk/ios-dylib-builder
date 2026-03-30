@@ -39,6 +39,7 @@ jobs:
           find source_code -type f | head -200
 
       - name: Compile dylib
+        shell: bash
         run: |
           cd source_code
 
@@ -59,22 +60,30 @@ jobs:
 
           FRAMEWORK_FLAGS=""
           FRAMEWORK_SEARCH=""
-          while IFS= read -r -d '' fw_dir; do
+          while IFS= read -r fw_dir; do
+            [ -z "$fw_dir" ] && continue
             fw_name=$(basename "$fw_dir" .framework)
             FRAMEWORK_FLAGS="$FRAMEWORK_FLAGS -framework $fw_name"
             fw_parent=$(dirname "$fw_dir")
-            FRAMEWORK_SEARCH="$FRAMEWORK_SEARCH -F\"$fw_parent\""
+            FRAMEWORK_SEARCH="$FRAMEWORK_SEARCH -F$fw_parent"
             echo "Found framework: $fw_name at $fw_dir"
-          done < <(find . -name "*.framework" -type d -print0)
+          done < <(find . -name "*.framework" -type d 2>/dev/null)
 
-          mapfile -t C_SOURCES < <(find . -name "*.c" -not -path "*/.vscode/*" -not -path "*/xcuserdata/*" -type f)
-          mapfile -t CPP_SOURCES < <(find . \( -name "*.cpp" -o -name "*.cxx" -o -name "*.cc" \) -not -path "*/.vscode/*" -not -path "*/xcuserdata/*" -type f)
-          mapfile -t OBJC_SOURCES < <(find . -name "*.m" -not -path "*/.vscode/*" -not -path "*/xcuserdata/*" -type f)
-          mapfile -t OBJCPP_SOURCES < <(find . -name "*.mm" -not -path "*/.vscode/*" -not -path "*/xcuserdata/*" -type f)
-          mapfile -t SWIFT_SOURCES < <(find . -name "*.swift" -not -path "*/.vscode/*" -not -path "*/xcuserdata/*" -type f)
+          SRC_LIST=$(mktemp)
+          find . -name "*.c" -not -path "*/.vscode/*" -not -path "*/xcuserdata/*" -type f > "${SRC_LIST}.c"
+          find . \( -name "*.cpp" -o -name "*.cxx" -o -name "*.cc" \) -not -path "*/.vscode/*" -not -path "*/xcuserdata/*" -type f > "${SRC_LIST}.cpp"
+          find . -name "*.m" -not -path "*/.vscode/*" -not -path "*/xcuserdata/*" -type f > "${SRC_LIST}.m"
+          find . -name "*.mm" -not -path "*/.vscode/*" -not -path "*/xcuserdata/*" -type f > "${SRC_LIST}.mm"
+          find . -name "*.swift" -not -path "*/.vscode/*" -not -path "*/xcuserdata/*" -type f > "${SRC_LIST}.swift"
 
-          TOTAL=$(( ${#C_SOURCES[@]} + ${#CPP_SOURCES[@]} + ${#OBJC_SOURCES[@]} + ${#OBJCPP_SOURCES[@]} + ${#SWIFT_SOURCES[@]} ))
-          echo "Found $TOTAL source files: ${#C_SOURCES[@]} C, ${#CPP_SOURCES[@]} C++, ${#OBJC_SOURCES[@]} ObjC, ${#OBJCPP_SOURCES[@]} ObjC++, ${#SWIFT_SOURCES[@]} Swift"
+          C_COUNT=$(wc -l < "${SRC_LIST}.c" | tr -d ' ')
+          CPP_COUNT=$(wc -l < "${SRC_LIST}.cpp" | tr -d ' ')
+          OBJC_COUNT=$(wc -l < "${SRC_LIST}.m" | tr -d ' ')
+          OBJCPP_COUNT=$(wc -l < "${SRC_LIST}.mm" | tr -d ' ')
+          SWIFT_COUNT=$(wc -l < "${SRC_LIST}.swift" | tr -d ' ')
+          TOTAL=$((C_COUNT + CPP_COUNT + OBJC_COUNT + OBJCPP_COUNT + SWIFT_COUNT))
+
+          echo "Found $TOTAL source files: $C_COUNT C, $CPP_COUNT C++, $OBJC_COUNT ObjC, $OBJCPP_COUNT ObjC++, $SWIFT_COUNT Swift"
 
           if [ "$TOTAL" -eq 0 ]; then
             send_telegram "❌ فشل البناء: لم يتم العثور على ملفات مصدر داخل الملف المرسل.
@@ -84,11 +93,12 @@ jobs:
           fi
 
           INCLUDE_FLAGS=""
-          while IFS= read -r -d '' dir; do
-            INCLUDE_FLAGS="$INCLUDE_FLAGS -I\"$dir\""
-          done < <(find . -type d -print0)
+          while IFS= read -r dir; do
+            [ -z "$dir" ] && continue
+            INCLUDE_FLAGS="$INCLUDE_FLAGS -I$dir"
+          done < <(find . -type d 2>/dev/null)
 
-          COMMON_FLAGS="$ARCH -isysroot \"$SDK_PATH\" -target arm64-apple-ios12.0 -DTARGET_OS_IPHONE=1"
+          COMMON_FLAGS="$ARCH -isysroot $SDK_PATH -target arm64-apple-ios12.0 -DTARGET_OS_IPHONE=1"
           COMMON_FLAGS="$COMMON_FLAGS -Wno-unused-variable -Wno-unused-function -Wno-deprecated-declarations"
           COMMON_FLAGS="$COMMON_FLAGS -Wno-unused-but-set-variable -Wno-unused-value -Wno-nullability-completeness"
           COMMON_FLAGS="$COMMON_FLAGS -Wno-expansion-to-defined -Wno-nullable-to-nonnull-conversion"
@@ -96,7 +106,7 @@ jobs:
           COMMON_FLAGS="$COMMON_FLAGS -fvisibility=hidden -fvisibility-inlines-hidden"
 
           COMPILE_OK=true
-          OBJ_FILES=()
+          OBJ_LIST_FILE=$(mktemp)
           COMPILED=0
 
           compile_file() {
@@ -107,33 +117,39 @@ jobs:
 
             COMPILED=$((COMPILED + 1))
             echo "[$COMPILED/$TOTAL] Compiling: $src"
-            eval "$compiler" -c -o "\"$obj\"" $COMMON_FLAGS $INCLUDE_FLAGS $FRAMEWORK_SEARCH $extra_flags "\"$src\"" 2>&1 | tee -a "$BUILD_LOG"
-            if [ ${PIPESTATUS[0]} -ne 0 ]; then
+            $compiler -c -o "$obj" $COMMON_FLAGS $INCLUDE_FLAGS $FRAMEWORK_SEARCH $extra_flags "$src" 2>&1 | tee -a "$BUILD_LOG"
+            local status=${PIPESTATUS[0]}
+            if [ $status -ne 0 ]; then
               COMPILE_OK=false
               echo "FAILED: $src"
+            else
+              echo "$obj" >> "$OBJ_LIST_FILE"
             fi
-            OBJ_FILES+=("$obj")
           }
 
-          for src in "${C_SOURCES[@]}"; do
+          while IFS= read -r src; do
+            [ -z "$src" ] && continue
             obj="${src%.c}.o"
             compile_file "$src" "$obj" "clang" ""
-          done
+          done < "${SRC_LIST}.c"
 
-          for src in "${CPP_SOURCES[@]}"; do
+          while IFS= read -r src; do
+            [ -z "$src" ] && continue
             obj="${src%.*}.o"
             compile_file "$src" "$obj" "clang++" "-std=c++17"
-          done
+          done < "${SRC_LIST}.cpp"
 
-          for src in "${OBJC_SOURCES[@]}"; do
+          while IFS= read -r src; do
+            [ -z "$src" ] && continue
             obj="${src%.m}.o"
             compile_file "$src" "$obj" "clang" "-x objective-c -fobjc-arc"
-          done
+          done < "${SRC_LIST}.m"
 
-          for src in "${OBJCPP_SOURCES[@]}"; do
+          while IFS= read -r src; do
+            [ -z "$src" ] && continue
             obj="${src%.mm}.o"
             compile_file "$src" "$obj" "clang++" "-x objective-c++ -fobjc-arc -std=c++17"
-          done
+          done < "${SRC_LIST}.mm"
 
           if [ "$COMPILE_OK" = false ]; then
             ERROR_MSG=$(tail -80 "$BUILD_LOG" | grep -i "error" | head -40)
@@ -146,18 +162,14 @@ jobs:
             exit 1
           fi
 
-          echo "=== Linking ${#OBJ_FILES[@]} object files ==="
+          OBJ_COUNT=$(wc -l < "$OBJ_LIST_FILE" | tr -d ' ')
+          echo "=== Linking $OBJ_COUNT object files ==="
 
           LINK_FRAMEWORKS="-framework Foundation -framework UIKit -framework Metal -framework MetalKit -framework AVFoundation -framework CoreGraphics -framework QuartzCore -framework Security"
 
-          OBJ_LIST=$(mktemp)
-          for obj in "${OBJ_FILES[@]}"; do
-            echo "$obj" >> "$OBJ_LIST"
-          done
-
-          eval clang++ -dynamiclib -o "\"$OUTPUT\"" $ARCH -isysroot "\"$SDK_PATH\"" \
+          clang++ -dynamiclib -o "$OUTPUT" $ARCH -isysroot "$SDK_PATH" \
             -target arm64-apple-ios12.0 \
-            -filelist "\"$OBJ_LIST\"" \
+            -filelist "$OBJ_LIST_FILE" \
             $FRAMEWORK_SEARCH \
             $LINK_FRAMEWORKS $FRAMEWORK_FLAGS \
             -fobjc-arc \
@@ -166,7 +178,7 @@ jobs:
             -install_name @rpath/"$OUTPUT" \
             2>&1 | tee -a "$BUILD_LOG"
 
-          if [ ! -f "$OUTPUT" ] || [ ${PIPESTATUS[0]} -ne 0 ]; then
+          if [ ! -f "$OUTPUT" ]; then
             ERROR_MSG=$(tail -50 "$BUILD_LOG")
             send_telegram "❌ فشل الربط. سبب الخطأ:
 
