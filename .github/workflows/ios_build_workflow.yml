@@ -88,11 +88,51 @@ jobs:
           COMPILE_OK=true
 
           if [ ! -z "$(echo $SWIFT_SOURCES | tr -d ' ')" ]; then
-            echo "=== Compiling with swiftc ==="
+            echo "=== Compiling C/C++/ObjC objects for Swift linking ==="
+            OBJ_FILES=""
+
+            for src in $C_SOURCES; do
+              obj="${src%.c}.o"
+              clang -c -o "$obj" $ARCH -isysroot "$SDK_PATH" -target arm64-apple-ios15.0 \
+                $INCLUDE_FLAGS -Wno-unused-variable -Wno-unused-function \
+                "$src" 2>&1 | tee -a "$BUILD_LOG" || COMPILE_OK=false
+              OBJ_FILES="$OBJ_FILES $obj"
+            done
+            for src in $CPP_SOURCES; do
+              obj="${src%.*}.o"
+              clang++ -c -o "$obj" $ARCH -isysroot "$SDK_PATH" -target arm64-apple-ios15.0 \
+                $INCLUDE_FLAGS -std=c++17 -Wno-unused-variable -Wno-unused-function \
+                "$src" 2>&1 | tee -a "$BUILD_LOG" || COMPILE_OK=false
+              OBJ_FILES="$OBJ_FILES $obj"
+            done
+            for src in $OBJC_SOURCES; do
+              obj="${src%.m}.o"
+              clang -c -o "$obj" $ARCH -isysroot "$SDK_PATH" -target arm64-apple-ios15.0 \
+                $INCLUDE_FLAGS -x objective-c -fobjc-arc -Wno-unused-variable -Wno-unused-function \
+                "$src" 2>&1 | tee -a "$BUILD_LOG" || COMPILE_OK=false
+              OBJ_FILES="$OBJ_FILES $obj"
+            done
+            for src in $OBJCPP_SOURCES; do
+              obj="${src%.mm}.o"
+              clang++ -c -o "$obj" $ARCH -isysroot "$SDK_PATH" -target arm64-apple-ios15.0 \
+                $INCLUDE_FLAGS -x objective-c++ -fobjc-arc -std=c++17 -Wno-unused-variable -Wno-unused-function \
+                "$src" 2>&1 | tee -a "$BUILD_LOG" || COMPILE_OK=false
+              OBJ_FILES="$OBJ_FILES $obj"
+            done
+
+            if [ "$COMPILE_OK" = false ]; then
+              ERROR_MSG=$(sed -n '1,50p' "$BUILD_LOG")
+              send_telegram "❌ فشل البناء أثناء ترجمة ملفات C/ObjC.
+
+          ${ERROR_MSG}"
+              exit 1
+            fi
+
+            echo "=== Compiling Swift and linking ==="
             swiftc -emit-library -o "$OUTPUT" $ARCH -sdk "$SDK_PATH" \
               -target arm64-apple-ios15.0 \
               $INCLUDE_FLAGS \
-              $SWIFT_SOURCES $ALL_C 2>&1 | tee "$BUILD_LOG" || COMPILE_OK=false
+              $SWIFT_SOURCES $OBJ_FILES 2>&1 | tee "$BUILD_LOG" || COMPILE_OK=false
           else
             echo "=== Compiling object files ==="
             OBJ_FILES=""
