@@ -1,100 +1,76 @@
-name: iOS DyLib Builder
+name: Build iOS dylib
 
 on:
   workflow_dispatch:
     inputs:
       file_url:
-        description: 'URL of the source archive (.zip or .tar.gz)'
+        description: 'URL of the zip file to build'
         required: true
       chat_id:
-        description: 'Telegram chat ID to send the result to'
+        description: 'Telegram Chat ID to send the result back'
         required: true
 
 jobs:
   build:
     runs-on: macos-latest
-
     steps:
-      - name: Download source archive
+      - name: Download source
         run: |
-          curl -L "${{ github.event.inputs.file_url }}" -o source_archive
+          curl -L "${{ github.event.inputs.file_url }}" -o project.zip
+          mkdir source_code
+          unzip project.zip -d source_code
 
-      - name: Extract archive
+      - name: Compile dylib
+        id: compile
         run: |
-          mkdir -p source
-          if file source_archive | grep -q "Zip"; then
-            unzip -o source_archive -d source
-          else
-            tar -xzf source_archive -C source
-          fi
-
-      - name: Detect language and build DyLib
-        run: |
-          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
-          TARGET="arm64-apple-ios14.0"
-          INCLUDE_DIRS=$(find source -type d | sed 's/^/-I/' | tr '\n' ' ')
-          OUTPUT="output.dylib"
-
-          SWIFT_FILES=$(find source -name "*.swift" | tr '\n' ' ')
-          OBJC_FILES=$(find source \( -name "*.m" -o -name "*.mm" \) | tr '\n' ' ')
-          CPP_FILES=$(find source \( -name "*.cpp" -o -name "*.cxx" -o -name "*.cc" \) | tr '\n' ' ')
-          C_FILES=$(find source -name "*.c" | tr '\n' ' ')
-
-          if [ -n "$SWIFT_FILES" ]; then
-            echo ">>> Building Swift project..."
-            swiftc $SWIFT_FILES \
-              -sdk $SDK \
-              -target $TARGET \
-              -emit-library \
-              -o $OUTPUT
-
-          elif [ -n "$OBJC_FILES" ]; then
-            echo ">>> Building Objective-C project..."
-            clang $OBJC_FILES $C_FILES \
-              -isysroot $SDK \
-              -target $TARGET \
-              -fobjc-arc \
-              -framework Foundation \
-              $INCLUDE_DIRS \
-              -dynamiclib \
-              -o $OUTPUT
-
-          elif [ -n "$CPP_FILES" ]; then
-            echo ">>> Building C++ project..."
-            clang++ $CPP_FILES $C_FILES \
-              -isysroot $SDK \
-              -target $TARGET \
-              $INCLUDE_DIRS \
-              -dynamiclib \
-              -o $OUTPUT
-
-          elif [ -n "$C_FILES" ]; then
-            echo ">>> Building C project..."
-            clang $C_FILES \
-              -isysroot $SDK \
-              -target $TARGET \
-              $INCLUDE_DIRS \
-              -dynamiclib \
-              -o $OUTPUT
-
-          else
-            curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_TOKEN }}/sendMessage" \
-              -d "chat_id=${{ github.event.inputs.chat_id }}" \
-              -d "text=❌ لم يتم العثور على ملفات مصدر مدعومة (.c .cpp .swift .m .mm)"
+          cd source_code
+          
+          # البحث عن كافة ملفات المصدر في جميع المجلدات الفرعية
+          SOURCES=$(find . -name "*.c" -o -name "*.cpp" -o -name "*.m" -o -name "*.mm" -o -name "*.swift")
+          
+          if [ -z "$SOURCES" ]; then
+            echo "ERROR_MSG=❌ فشل البناء. لم يتم العثور على أي ملفات مصدر (.c, .cpp, .swift, .m, .mm) داخل الملف المضغوط. يرجى التأكد من محتوى الملف." >> $GITHUB_ENV
             exit 1
           fi
 
-      - name: Send DyLib to Telegram
-        if: success()
-        run: |
-          curl -F "chat_id=${{ github.event.inputs.chat_id }}" \
-               -F "document=@output.dylib" \
-               -F "caption=✅ تم البناء بنجاح! ملف .dylib جاهز لـ iOS ARM64" \
-               "https://api.telegram.org/bot${{ secrets.TELEGRAM_TOKEN }}/sendDocument"
+          # تحديد المعمارية والـ SDK
+          SDK_PATH=$(xcrun --sdk iphoneos --show-sdk-path)
+          ARCH="-arch arm64"
+          
+          # فصل ملفات Swift عن ملفات C/C++/ObjC
+          SWIFT_SOURCES=$(find . -name "*.swift")
+          C_SOURCES=$(find . -name "*.c" -o -name "*.cpp" -o -name "*.m" -o -name "*.mm")
 
-      - name: Send failure message to Telegram
-        if: failure()
+          if [ ! -z "$SWIFT_SOURCES" ]; then
+            echo "Compiling Swift sources..."
+            swiftc -emit-library -o output.dylib $ARCH -sdk $SDK_PATH $SWIFT_SOURCES $C_SOURCES || { echo "ERROR_MSG=❌ فشل البناء أثناء ترجمة ملفات Swift. يرجى التأكد من سلامة الكود." >> $GITHUB_ENV; exit 1; }
+          else
+            echo "Compiling C/C++/ObjC sources..."
+            clang -dynamiclib -o output.dylib $ARCH -isysroot $SDK_PATH $C_SOURCES -framework Foundation || { echo "ERROR_MSG=❌ فشل البناء أثناء ترجمة ملفات C/ObjC. يرجى التأكد من سلامة الكود." >> $GITHUB_ENV; exit 1; }
+          fi
+          echo "BUILD_SUCCESS=true" >> $GITHUB_ENV
+
+      - name: Upload Artifact
+        if: env.BUILD_SUCCESS == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-dylib
+          path: source_code/output.dylib
+
+      - name: Send Success to Telegram
+        if: env.BUILD_SUCCESS == 'true'
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          CHAT_ID: ${{ github.event.inputs.chat_id }}
         run: |
-          curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_TOKEN }}/sendMessage" \
-               -d "chat_id=${{ github.event.inputs.chat_id }}" \
-               -d "text=❌ فشل البناء. تأكد من أن الملف يحتوي على ملفات مصدر صالحة (.c .cpp .swift .m .mm)"
+          curl -F "chat_id=$CHAT_ID" -F "document=@source_code/output.dylib" -F "caption=✅ تم بناء ملف الـ .dylib بنجاح لـ iOS ARM64! 🚀" "https://api.org/bot$TELEGRAM_TOKEN/sendDocument"
+
+      - name: Send Failure to Telegram
+        if: failure()
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          CHAT_ID: ${{ github.event.inputs.chat_id }}
+        run: |
+          MSG="${{ env.ERROR_MSG }}"
+          if [ -z "$MSG" ]; then MSG="❌ حدث خطأ غير متوقع أثناء عملية البناء على GitHub Actions."; fi
+          curl -X POST "https://api.telegram.org/bot$TELEGRAM_TOKEN/sendMessage" -d "chat_id=$CHAT_ID&text=$MSG"
