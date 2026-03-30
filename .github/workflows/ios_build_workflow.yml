@@ -1,60 +1,100 @@
-name: Build iOS dylib
+name: iOS DyLib Builder
 
 on:
   workflow_dispatch:
     inputs:
       file_url:
-        description: 'URL of the zip file to build'
+        description: 'URL of the source archive (.zip or .tar.gz)'
         required: true
       chat_id:
-        description: 'Telegram Chat ID to send the result back'
+        description: 'Telegram chat ID to send the result to'
         required: true
 
 jobs:
   build:
     runs-on: macos-latest
-    steps:
-      - name: Download source
-        run: |
-          curl -L "${{ github.event.inputs.file_url }}" -o project.zip
-          unzip project.zip -d source_code
 
-      - name: Compile dylib
+    steps:
+      - name: Download source archive
         run: |
-          cd source_code
-          # البحث عن كافة ملفات المصدر المدعومة
-          SOURCES=$(find . -name "*.c" -o -name "*.cpp" -o -name "*.m" -o -name "*.mm" -o -name "*.swift")
-          
-          if [ -z "$SOURCES" ]; then
-            echo "No source files found!"
+          curl -L "${{ github.event.inputs.file_url }}" -o source_archive
+
+      - name: Extract archive
+        run: |
+          mkdir -p source
+          if file source_archive | grep -q "Zip"; then
+            unzip -o source_archive -d source
+          else
+            tar -xzf source_archive -C source
+          fi
+
+      - name: Detect language and build DyLib
+        run: |
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          TARGET="arm64-apple-ios14.0"
+          INCLUDE_DIRS=$(find source -type d | sed 's/^/-I/' | tr '\n' ' ')
+          OUTPUT="output.dylib"
+
+          SWIFT_FILES=$(find source -name "*.swift" | tr '\n' ' ')
+          OBJC_FILES=$(find source \( -name "*.m" -o -name "*.mm" \) | tr '\n' ' ')
+          CPP_FILES=$(find source \( -name "*.cpp" -o -name "*.cxx" -o -name "*.cc" \) | tr '\n' ' ')
+          C_FILES=$(find source -name "*.c" | tr '\n' ' ')
+
+          if [ -n "$SWIFT_FILES" ]; then
+            echo ">>> Building Swift project..."
+            swiftc $SWIFT_FILES \
+              -sdk $SDK \
+              -target $TARGET \
+              -emit-library \
+              -o $OUTPUT
+
+          elif [ -n "$OBJC_FILES" ]; then
+            echo ">>> Building Objective-C project..."
+            clang $OBJC_FILES $C_FILES \
+              -isysroot $SDK \
+              -target $TARGET \
+              -fobjc-arc \
+              -framework Foundation \
+              $INCLUDE_DIRS \
+              -dynamiclib \
+              -o $OUTPUT
+
+          elif [ -n "$CPP_FILES" ]; then
+            echo ">>> Building C++ project..."
+            clang++ $CPP_FILES $C_FILES \
+              -isysroot $SDK \
+              -target $TARGET \
+              $INCLUDE_DIRS \
+              -dynamiclib \
+              -o $OUTPUT
+
+          elif [ -n "$C_FILES" ]; then
+            echo ">>> Building C project..."
+            clang $C_FILES \
+              -isysroot $SDK \
+              -target $TARGET \
+              $INCLUDE_DIRS \
+              -dynamiclib \
+              -o $OUTPUT
+
+          else
+            curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_TOKEN }}/sendMessage" \
+              -d "chat_id=${{ github.event.inputs.chat_id }}" \
+              -d "text=❌ لم يتم العثور على ملفات مصدر مدعومة (.c .cpp .swift .m .mm)"
             exit 1
           fi
 
-          # تحديد المعمارية والـ SDK
-          SDK_PATH=$(xcrun --sdk iphoneos --show-sdk-path)
-          ARCH="-arch arm64"
-          
-          # فصل ملفات Swift عن ملفات C/C++/ObjC
-          SWIFT_SOURCES=$(find . -name "*.swift")
-          C_SOURCES=$(find . -name "*.c" -o -name "*.cpp" -o -name "*.m" -o -name "*.mm")
-
-          if [ ! -z "$SWIFT_SOURCES" ]; then
-            echo "Compiling Swift sources..."
-            swiftc -emit-library -o output.dylib $ARCH -sdk $SDK_PATH $SWIFT_SOURCES $C_SOURCES
-          else
-            echo "Compiling C/C++/ObjC sources..."
-            clang -dynamiclib -o output.dylib $ARCH -isysroot $SDK_PATH $C_SOURCES -framework Foundation
-          fi
-
-      - name: Upload Artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: ios-dylib
-          path: source_code/output.dylib
-
-      - name: Send to Telegram
-        env:
-          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
-          CHAT_ID: ${{ github.event.inputs.chat_id }}
+      - name: Send DyLib to Telegram
+        if: success()
         run: |
-          curl -F "chat_id=$CHAT_ID" -F "document=@source_code/output.dylib" "https://api.telegram.org/bot$TELEGRAM_TOKEN/sendDocument"
+          curl -F "chat_id=${{ github.event.inputs.chat_id }}" \
+               -F "document=@output.dylib" \
+               -F "caption=✅ تم البناء بنجاح! ملف .dylib جاهز لـ iOS ARM64" \
+               "https://api.telegram.org/bot${{ secrets.TELEGRAM_TOKEN }}/sendDocument"
+
+      - name: Send failure message to Telegram
+        if: failure()
+        run: |
+          curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_TOKEN }}/sendMessage" \
+               -d "chat_id=${{ github.event.inputs.chat_id }}" \
+               -d "text=❌ فشل البناء. تأكد من أن الملف يحتوي على ملفات مصدر صالحة (.c .cpp .swift .m .mm)"
