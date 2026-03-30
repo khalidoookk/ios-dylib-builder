@@ -54,8 +54,7 @@ jobs:
             local MSG="$1"
             curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
               --data-urlencode "chat_id=${CHAT_ID}" \
-              --data-urlencode "text=${MSG}" \
-              --data-urlencode "parse_mode=HTML" > /dev/null 2>&1 || true
+              --data-urlencode "text=${MSG}"
           }
 
           SWIFT_SOURCES=$(find . -type f -name "*.swift" | tr '\n' ' ')
@@ -145,10 +144,7 @@ jobs:
             done
 
             if [ "$COMPILE_OK" = false ]; then
-              ERROR_MSG=$(grep -E "error:" "$BUILD_LOG" | head -50)
-              if [ -z "$ERROR_MSG" ]; then
-                ERROR_MSG=$(tail -50 "$BUILD_LOG")
-              fi
+              ERROR_MSG=$(sed -n '1,50p' "$BUILD_LOG")
               send_telegram "❌ فشل البناء أثناء الترجمة.
 
           ${ERROR_MSG}"
@@ -165,10 +161,7 @@ jobs:
           fi
 
           if [ ! -f "$OUTPUT" ] || [ "$COMPILE_OK" = false ]; then
-            ERROR_MSG=$(grep -E "error:" "$BUILD_LOG" | head -50)
-            if [ -z "$ERROR_MSG" ]; then
-              ERROR_MSG=$(tail -50 "$BUILD_LOG")
-            fi
+            ERROR_MSG=$(sed -n '1,50p' "$BUILD_LOG")
             send_telegram "❌ فشل البناء. سبب الخطأ:
 
           ${ERROR_MSG}"
