@@ -35,8 +35,20 @@ jobs:
           find source_code -name "__MACOSX" -exec rm -rf {} + 2>/dev/null || true
           find source_code -name ".DS_Store" -delete 2>/dev/null || true
 
+          # Fix spaces in directory names by replacing them with underscores
+          cd source_code
+          find . -depth -name "* *" | while IFS= read -r f; do
+            dir=$(dirname "$f")
+            base=$(basename "$f")
+            newbase=$(echo "$base" | tr ' ' '_')
+            if [ "$base" != "$newbase" ]; then
+              mv "$f" "$dir/$newbase"
+              echo "Renamed: $f -> $dir/$newbase"
+            fi
+          done
+
           echo "=== Extracted files ==="
-          find source_code -type f | head -200
+          find . -type f | head -200
 
       - name: Compile dylib
         shell: bash
@@ -59,22 +71,22 @@ jobs:
           }
 
           FRAMEWORK_FLAGS=""
-          FRAMEWORK_SEARCH=""
+          FW_SEARCH_ARGS=()
           while IFS= read -r fw_dir; do
             [ -z "$fw_dir" ] && continue
             fw_name=$(basename "$fw_dir" .framework)
             FRAMEWORK_FLAGS="$FRAMEWORK_FLAGS -framework $fw_name"
             fw_parent=$(dirname "$fw_dir")
-            FRAMEWORK_SEARCH="$FRAMEWORK_SEARCH -F$fw_parent"
+            FW_SEARCH_ARGS+=("-F$fw_parent")
             echo "Found framework: $fw_name at $fw_dir"
           done < <(find . -name "*.framework" -type d 2>/dev/null)
 
           SRC_LIST=$(mktemp)
-          find . -name "*.c" -not -path "*/.vscode/*" -not -path "*/xcuserdata/*" -type f > "${SRC_LIST}.c"
-          find . \( -name "*.cpp" -o -name "*.cxx" -o -name "*.cc" \) -not -path "*/.vscode/*" -not -path "*/xcuserdata/*" -type f > "${SRC_LIST}.cpp"
-          find . -name "*.m" -not -path "*/.vscode/*" -not -path "*/xcuserdata/*" -type f > "${SRC_LIST}.m"
-          find . -name "*.mm" -not -path "*/.vscode/*" -not -path "*/xcuserdata/*" -type f > "${SRC_LIST}.mm"
-          find . -name "*.swift" -not -path "*/.vscode/*" -not -path "*/xcuserdata/*" -type f > "${SRC_LIST}.swift"
+          find . -name "*.c" -not -path "*/.vscode/*" -not -path "*/xcuserdata/*" -not -path "*/.xcodeproj/*" -not -path "*/xcworkspace/*" -type f > "${SRC_LIST}.c"
+          find . \( -name "*.cpp" -o -name "*.cxx" -o -name "*.cc" \) -not -path "*/.vscode/*" -not -path "*/xcuserdata/*" -not -path "*/.xcodeproj/*" -type f > "${SRC_LIST}.cpp"
+          find . -name "*.m" -not -path "*/.vscode/*" -not -path "*/xcuserdata/*" -not -path "*/.xcodeproj/*" -type f > "${SRC_LIST}.m"
+          find . -name "*.mm" -not -path "*/.vscode/*" -not -path "*/xcuserdata/*" -not -path "*/.xcodeproj/*" -type f > "${SRC_LIST}.mm"
+          find . -name "*.swift" -not -path "*/.vscode/*" -not -path "*/xcuserdata/*" -not -path "*/.xcodeproj/*" -type f > "${SRC_LIST}.swift"
 
           C_COUNT=$(wc -l < "${SRC_LIST}.c" | tr -d ' ')
           CPP_COUNT=$(wc -l < "${SRC_LIST}.cpp" | tr -d ' ')
@@ -92,18 +104,19 @@ jobs:
             exit 1
           fi
 
-          INCLUDE_FLAGS=""
+          INCLUDE_ARGS=()
           while IFS= read -r dir; do
             [ -z "$dir" ] && continue
-            INCLUDE_FLAGS="$INCLUDE_FLAGS -I$dir"
-          done < <(find . -type d 2>/dev/null)
+            INCLUDE_ARGS+=("-I$dir")
+          done < <(find . -type d -not -path "*/.xcodeproj/*" -not -path "*/xcuserdata/*" -not -path "*/xcworkspace/*" -not -path "*/.vscode/*" 2>/dev/null)
 
-          COMMON_FLAGS="$ARCH -isysroot $SDK_PATH -target arm64-apple-ios12.0 -DTARGET_OS_IPHONE=1"
-          COMMON_FLAGS="$COMMON_FLAGS -Wno-unused-variable -Wno-unused-function -Wno-deprecated-declarations"
-          COMMON_FLAGS="$COMMON_FLAGS -Wno-unused-but-set-variable -Wno-unused-value -Wno-nullability-completeness"
-          COMMON_FLAGS="$COMMON_FLAGS -Wno-expansion-to-defined -Wno-nullable-to-nonnull-conversion"
-          COMMON_FLAGS="$COMMON_FLAGS -Wno-incompatible-pointer-types -Wno-format -Wno-objc-method-access"
-          COMMON_FLAGS="$COMMON_FLAGS -fvisibility=hidden -fvisibility-inlines-hidden"
+          COMMON_ARGS=($ARCH -isysroot "$SDK_PATH" -target arm64-apple-ios12.0 -DTARGET_OS_IPHONE=1)
+          COMMON_ARGS+=(-Wno-unused-variable -Wno-unused-function -Wno-deprecated-declarations)
+          COMMON_ARGS+=(-Wno-unused-but-set-variable -Wno-unused-value -Wno-nullability-completeness)
+          COMMON_ARGS+=(-Wno-expansion-to-defined -Wno-nullable-to-nonnull-conversion)
+          COMMON_ARGS+=(-Wno-incompatible-pointer-types -Wno-format -Wno-objc-method-access)
+          COMMON_ARGS+=(-Wno-shorten-64-to-32 -Wno-comma -Wno-sign-conversion)
+          COMMON_ARGS+=(-fvisibility=hidden -fvisibility-inlines-hidden)
 
           COMPILE_OK=true
           OBJ_LIST_FILE=$(mktemp)
@@ -113,11 +126,12 @@ jobs:
             local src="$1"
             local obj="$2"
             local compiler="$3"
-            local extra_flags="$4"
+            shift 3
+            local extra_flags=("$@")
 
             COMPILED=$((COMPILED + 1))
             echo "[$COMPILED/$TOTAL] Compiling: $src"
-            $compiler -c -o "$obj" $COMMON_FLAGS $INCLUDE_FLAGS $FRAMEWORK_SEARCH $extra_flags "$src" 2>&1 | tee -a "$BUILD_LOG"
+            "$compiler" -c -o "$obj" "${COMMON_ARGS[@]}" "${INCLUDE_ARGS[@]}" "${FW_SEARCH_ARGS[@]}" "${extra_flags[@]}" "$src" 2>&1 | tee -a "$BUILD_LOG"
             local status=${PIPESTATUS[0]}
             if [ $status -ne 0 ]; then
               COMPILE_OK=false
@@ -130,7 +144,7 @@ jobs:
           while IFS= read -r src; do
             [ -z "$src" ] && continue
             obj="${src%.c}.o"
-            compile_file "$src" "$obj" "clang" ""
+            compile_file "$src" "$obj" "clang"
           done < "${SRC_LIST}.c"
 
           while IFS= read -r src; do
@@ -142,17 +156,17 @@ jobs:
           while IFS= read -r src; do
             [ -z "$src" ] && continue
             obj="${src%.m}.o"
-            compile_file "$src" "$obj" "clang" "-x objective-c -fobjc-arc"
+            compile_file "$src" "$obj" "clang" "-x" "objective-c" "-fobjc-arc"
           done < "${SRC_LIST}.m"
 
           while IFS= read -r src; do
             [ -z "$src" ] && continue
             obj="${src%.mm}.o"
-            compile_file "$src" "$obj" "clang++" "-x objective-c++ -fobjc-arc -std=c++17"
+            compile_file "$src" "$obj" "clang++" "-x" "objective-c++" "-fobjc-arc" "-std=c++17"
           done < "${SRC_LIST}.mm"
 
           if [ "$COMPILE_OK" = false ]; then
-            ERROR_MSG=$(tail -80 "$BUILD_LOG" | grep -i "error" | head -40)
+            ERROR_MSG=$(grep -i "error:" "$BUILD_LOG" | head -40)
             if [ -z "$ERROR_MSG" ]; then
               ERROR_MSG=$(tail -50 "$BUILD_LOG")
             fi
@@ -170,7 +184,7 @@ jobs:
           clang++ -dynamiclib -o "$OUTPUT" $ARCH -isysroot "$SDK_PATH" \
             -target arm64-apple-ios12.0 \
             -filelist "$OBJ_LIST_FILE" \
-            $FRAMEWORK_SEARCH \
+            "${FW_SEARCH_ARGS[@]}" \
             $LINK_FRAMEWORKS $FRAMEWORK_FLAGS \
             -fobjc-arc \
             -dead_strip \
